@@ -1,0 +1,60 @@
+name: dns-diag
+on: push
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: resolv.conf
+        run: cat /etc/resolv.conf; resolvectl status | head -30 || true
+      - name: dig by types and resolvers
+        run: |
+          sudo apt-get install -y -qq dnsutils >/dev/null 2>&1 || true
+          for srv in "" 168.63.129.16 8.8.8.8 1.1.1.1; do
+            for n in design.autopasha.ru autopasha.ru; do
+              for t in A AAAA CNAME MX NS SOA CAA; do
+                echo "== @${srv:-default} $n $t"
+                dig ${srv:+@$srv} +time=5 +tries=2 $n $t | grep -E 'status:|^[a-z].*IN' | head -8
+              done
+            done
+          done
+      - name: authoritative reg.ru directly
+        run: |
+          for ns in ns1.reg.ru ns2.reg.ru; do
+            for ip in $(dig +short $ns A) $(dig +short $ns AAAA); do
+              for proto in +notcp +tcp; do
+                echo "== @$ip ($ns) $proto design.autopasha.ru CAA"
+                dig @$ip $proto +time=5 +tries=1 +norec design.autopasha.ru CAA | grep -E 'status:|IN|timed out|connection' | head -5
+                echo "== @$ip ($ns) $proto design.autopasha.ru SOA"
+                dig @$ip $proto +time=5 +tries=1 +norec design.autopasha.ru SOA | grep -E 'status:|IN|timed out|connection' | head -5
+              done
+            done
+          done
+      - name: trace
+        run: dig +trace +time=5 design.autopasha.ru A | tail -25
+      - name: compare other reg.ru domains
+        run: |
+          for n in docs.garpixcms.ru travel.evgeniu-s.ru reg.ru; do
+            for t in A CAA SOA; do
+              echo "== default $n $t"; dig +time=5 +tries=2 $n $t | grep -E 'status:' ; done; done
+      - name: pages-health-check gem
+        run: |
+          sudo gem install github-pages-health-check --no-document >/dev/null 2>&1
+          cat > hc.rb <<'RUBY'
+          require "github-pages-health-check"
+          %w(design.autopasha.ru docs.garpixcms.ru).each do |h|
+            [:default, :public, :authoritative].each do |ns|
+              d = GitHubPages::HealthCheck::Domain.new(h, nameservers: ns)
+              puts "== #{h} #{ns}: dns_resolves=#{d.dns_resolves?.inspect} https_eligible=#{(d.https_eligible? rescue $!).inspect} caa_error=#{d.caa_error.inspect}"
+              r = GitHubPages::HealthCheck::Resolver.new(h, nameservers: ns)
+              [Dnsruby::Types::A, Dnsruby::Types::AAAA, Dnsruby::Types::CNAME, Dnsruby::Types::MX, Dnsruby::Types::NS, Dnsruby::Types::SOA, Dnsruby::Types::CAA].each do |t|
+                begin
+                  a = r.query(t)
+                  puts "   #{t}: ok #{a.map(&:to_s).first(2).join(' | ')}"
+                rescue => e
+                  puts "   #{t}: #{e.class} #{e.message[0,120]}"
+                end
+              end
+            end
+          end
+          RUBY
+          ruby hc.rb
